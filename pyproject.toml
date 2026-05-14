@@ -1,0 +1,11 @@
+[project]
+name = "ds4cuda"
+version = "0.5.0"
+description = "Single-model CUDA inference engine for DeepSeek-V4-Flash on DGX Spark."
+readme = "README.md"
+license = { text = "GPL-2.0" }
+requires-python = ">=3.10"
+dependencies = [
+    "huggingface-hub>=1.14.0",
+    "numpy>=2.2.6",
+]

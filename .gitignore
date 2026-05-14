@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info/
+
+# uv / virtualenv
+.venv/
+.uv-cache/
+
+# CUDA / C / C++ build artifacts
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.cubin
+*.ptx
+*.fatbin
+build-*/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local data / weights / large artifacts (never commit)
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
+weights/
+checkpoints/
+runs/
+outputs/
+logs/
+*.log
+
+# Stage dump / debug artifacts
+stage-dumps/
+*.dump
+*.npy
+debug-tensors/
+
+# Test reference vectors (kept separately, not in repo)
+test-vectors/
+
+# Profiler artifacts (raw captures, not in repo)
+*.nsys-rep
+*.sqlite
+*.ncu-rep
+traces/
+
+# Build infrastructure
+.makemtime/

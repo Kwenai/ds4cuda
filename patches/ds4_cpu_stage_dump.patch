@@ -1,0 +1,686 @@
+diff --git a/ds4.c b/ds4.c
+index c9156e0..0797689 100644
+--- a/ds4.c
++++ b/ds4.c
+@@ -589,6 +589,140 @@ static bool read_f32_binary_file(const char *path, float *data, uint64_t n) {
+ }
+ #endif
+ 
++/* =========================================================================
++ * CPU-path stage tensor dump (M1a alignment with ds4cuda).
++ *
++ * When DS4_CPU_DUMP_STAGES_DIR is set in the environment, the CPU prefill /
++ * decode paths emit one binary file per (layer, prompt-token, stage tag).
++ * This is a debug-only side channel; when the env var is unset, every
++ * dump call short-circuits via a single pointer test.
++ *
++ * File layout: 32-byte header followed by raw little-endian payload.
++ *
++ *   off  size  field
++ *   0    4     magic = "DSST"
++ *   4    4     version u32 = 1
++ *   8    4     dtype  u32 (0=fp32, 1=fp16, 2=int32)
++ *   12   8     n_elements u64
++ *   20   12    reserved (zero)
++ *
++ * File names: <DUMP_DIR>/il<LL>_tok<TT>_<tag>.bin
++ *
++ * DS4_CPU_DUMP_STAGES_LAYERS, when set to a comma-separated list of layer
++ * indices (e.g. "0,1"), restricts dumping to those layers.  Unset == dump
++ * every layer.
++ * ========================================================================= */
++
++#define DS4_CPU_DUMP_MAX_LAYER_FILTER 64
++
++static const char *ds4_cpu_dump_stages_dir = NULL;
++static int  ds4_cpu_dump_layer_filter[DS4_CPU_DUMP_MAX_LAYER_FILTER];
++static int  ds4_cpu_dump_layer_filter_count = 0;
++static bool ds4_cpu_dump_inited = false;
++
++static void ds4_cpu_dump_stage_init(void) {
++    if (ds4_cpu_dump_inited) return;
++    ds4_cpu_dump_inited = true;
++
++    const char *dir = getenv("DS4_CPU_DUMP_STAGES_DIR");
++    if (!dir || !dir[0]) {
++        ds4_cpu_dump_stages_dir = NULL;
++        return;
++    }
++    ds4_cpu_dump_stages_dir = dir;
++
++    const char *layers = getenv("DS4_CPU_DUMP_STAGES_LAYERS");
++    ds4_cpu_dump_layer_filter_count = 0;
++    if (layers && layers[0]) {
++        const char *p = layers;
++        while (*p && ds4_cpu_dump_layer_filter_count < DS4_CPU_DUMP_MAX_LAYER_FILTER) {
++            while (*p == ' ' || *p == ',') p++;
++            if (!*p) break;
++            char *end = NULL;
++            long v = strtol(p, &end, 10);
++            if (end == p) break;
++            if (v >= 0 && v < (long)DS4_N_LAYER) {
++                ds4_cpu_dump_layer_filter[ds4_cpu_dump_layer_filter_count++] = (int)v;
++            }
++            p = end;
++        }
++    }
++
++    fprintf(stderr, "ds4: CPU stage dump enabled, dir=%s, layers=", dir);
++    if (ds4_cpu_dump_layer_filter_count == 0) {
++        fprintf(stderr, "all\n");
++    } else {
++        for (int i = 0; i < ds4_cpu_dump_layer_filter_count; i++) {
++            fprintf(stderr, "%s%d", i ? "," : "", ds4_cpu_dump_layer_filter[i]);
++        }
++        fprintf(stderr, "\n");
++    }
++}
++
++static bool ds4_cpu_dump_stage_layer_active(uint32_t il) {
++    if (!ds4_cpu_dump_stages_dir) return false;
++    if (ds4_cpu_dump_layer_filter_count == 0) return true;
++    for (int i = 0; i < ds4_cpu_dump_layer_filter_count; i++) {
++        if ((int)il == ds4_cpu_dump_layer_filter[i]) return true;
++    }
++    return false;
++}
++
++static void ds4_cpu_dump_stage_unfiltered(
++        const char *tag,
++        uint32_t    il,
++        uint32_t    token_idx,
++        const void *data,
++        uint64_t    n_elements,
++        uint32_t    dtype) {
++    /* Same on-disk format as ds4_cpu_dump_stage but bypasses the
++     * DS4_CPU_DUMP_STAGES_LAYERS layer filter — used for the output head
++     * dumps which are emitted exactly once per prefill (after layer 42).
++     * The layer filter only constrains per-layer in-loop dumps. */
++    if (!ds4_cpu_dump_stages_dir || !data || n_elements == 0) return;
++
++    char path[1024];
++    snprintf(path, sizeof(path), "%s/il%02u_tok%02u_%s.bin",
++             ds4_cpu_dump_stages_dir, il, token_idx, tag);
++
++    FILE *fp = fopen(path, "wb");
++    if (!fp) {
++        fprintf(stderr, "ds4: cpu_dump_stage: failed to open %s: %s\n",
++                path, strerror(errno));
++        return;
++    }
++
++    uint8_t header[32];
++    memset(header, 0, sizeof(header));
++    header[0] = 'D'; header[1] = 'S'; header[2] = 'S'; header[3] = 'T';
++    uint32_t version = 1u;
++    memcpy(header + 4,  &version,    sizeof(version));
++    memcpy(header + 8,  &dtype,      sizeof(dtype));
++    memcpy(header + 12, &n_elements, sizeof(n_elements));
++
++    size_t elem_size = (dtype == 1) ? 2 : 4; /* fp16=2, fp32=4, int32=4 */
++    size_t total = (size_t)n_elements * elem_size;
++
++    bool ok = fwrite(header, 1, sizeof(header), fp) == sizeof(header);
++    if (ok) ok = fwrite(data, 1, total, fp) == total;
++    if (fclose(fp) != 0) ok = false;
++
++    if (!ok) {
++        fprintf(stderr, "ds4: cpu_dump_stage: failed to write %s\n", path);
++    }
++}
++
++static void ds4_cpu_dump_stage(
++        const char *tag,
++        uint32_t    il,
++        uint32_t    token_idx,
++        const void *data,
++        uint64_t    n_elements,
++        uint32_t    dtype) {
++    if (!ds4_cpu_dump_stage_layer_active(il)) return;
++    ds4_cpu_dump_stage_unfiltered(tag, il, token_idx, data, n_elements, dtype);
++}
++
+ typedef void (*ds4_parallel_fn)(void *ctx, uint64_t row0, uint64_t row1);
+ 
+ #define DS4_MAX_THREADS 32
+@@ -5755,6 +5889,23 @@ static void layer_ffn_shared_batch(
+                       n_tok);
+     if (profile) t_hc_norm = now_sec() - t0;
+ 
++    /* Stage dump: HC FFN pre outputs and ffn_norm. */
++    if (ds4_cpu_dump_stage_layer_active(il)) {
++        for (uint32_t t = 0; t < n_tok; t++) {
++            ds4_cpu_dump_stage("hc_ffn_pre_post_weights", il, t,
++                               post + (uint64_t)t * n_hc, n_hc, 0);
++            ds4_cpu_dump_stage("hc_ffn_pre_comb", il, t,
++                               comb + (uint64_t)t * n_hc * n_hc,
++                               (uint64_t)n_hc * n_hc, 0);
++            ds4_cpu_dump_stage("hc_ffn_pre", il, t,
++                               ffn_cur + (uint64_t)t * DS4_N_EMBD,
++                               DS4_N_EMBD, 0);
++            ds4_cpu_dump_stage("ffn_norm", il, t,
++                               norm + (uint64_t)t * DS4_N_EMBD,
++                               DS4_N_EMBD, 0);
++        }
++    }
++
+     t0 = profile ? now_sec() : 0.0;
+     if (routed_token_parallel) {
+         layer_routed_moe_tokens_parallel(moe, model, layer, norm, token_ids, n_tok, il);
+@@ -5774,10 +5925,142 @@ static void layer_ffn_shared_batch(
+     }
+     if (profile) t_routed = now_sec() - t0;
+ 
++    /* Stage dump: routed MoE intermediates.  We re-run a small subset of the
++     * router math on each dumped layer to surface logits/probs/selected without
++     * disturbing the forward pass.  In the routed-token-parallel path the
++     * mid_all buffer is consumed inside threads and not visible here, so we
++     * re-derive it locally; this doubles the routed compute on dumped layers
++     * only (~2 layers at debug time).  Final ffn_moe_out is moe[t]. */
++    if (ds4_cpu_dump_stage_layer_active(il)) {
++        const uint64_t dbg_expert_in_dim = layer->ffn_gate_exps->dim[0];
++        const uint64_t dbg_expert_out_dim = layer->ffn_gate_exps->dim[1];
++        const uint64_t dbg_xq_blocks = dbg_expert_in_dim / QK_K;
++        float *dbg_logits = xmalloc((size_t)DS4_N_EXPERT * sizeof(dbg_logits[0]));
++        float *dbg_probs  = xmalloc((size_t)DS4_N_EXPERT * sizeof(dbg_probs[0]));
++        int    dbg_selected[DS4_N_EXPERT_USED];
++        float  dbg_weights[DS4_N_EXPERT_USED];
++        float *dbg_mid_all = xmalloc((size_t)DS4_N_EXPERT_USED * dbg_expert_out_dim * sizeof(dbg_mid_all[0]));
++        block_q8_K *dbg_xq = xmalloc((size_t)dbg_xq_blocks * sizeof(dbg_xq[0]));
++
++        for (uint32_t t = 0; t < n_tok; t++) {
++            const float *x = norm + (uint64_t)t * DS4_N_EMBD;
++
++            /* Router logits + probs (= sqrt(softplus(logits))). */
++            matvec_f16(dbg_logits, model, layer->ffn_gate_inp, x);
++            for (int i = 0; i < DS4_N_EXPERT; i++) {
++                dbg_probs[i] = sqrtf(softplus_stable(dbg_logits[i]));
++            }
++            ds4_cpu_dump_stage("router_logits", il, t,
++                               dbg_logits, DS4_N_EXPERT, 0);
++            ds4_cpu_dump_stage("router_probs", il, t,
++                               dbg_probs, DS4_N_EXPERT, 0);
++
++            /* Selected experts + normalized weights. */
++            if (layer->ffn_gate_tid2eid) {
++                layer_hash_selected_experts(dbg_selected, model, layer, token_ids[t]);
++                layer_hash_router_weights_from_probs(dbg_weights, dbg_probs, dbg_selected);
++            } else {
++                /* Top-k path (layer 3..42): selection score = probs + bias.
++                 * Re-derive selection so we can dump it without disturbing
++                 * the forward pass, then call the helper for the actual
++                 * selected ids + weights (numerically identical). */
++                float dbg_selection[DS4_N_EXPERT];
++                memcpy(dbg_selection, dbg_probs, sizeof(dbg_selection));
++                if (layer->ffn_exp_probs_b) {
++                    const float *bias = tensor_data(model, layer->ffn_exp_probs_b);
++                    for (int i = 0; i < DS4_N_EXPERT; i++) dbg_selection[i] += bias[i];
++                }
++                ds4_cpu_dump_stage("router_probs_with_bias", il, t,
++                                   dbg_selection, DS4_N_EXPERT, 0);
++                layer_topk_selected_experts_from_probs(dbg_selected, dbg_weights, model, layer, dbg_probs);
++            }
++            ds4_cpu_dump_stage("router_topk_ids", il, t,
++                               dbg_selected, DS4_N_EXPERT_USED, 2);
++            ds4_cpu_dump_stage("router_topk_w", il, t,
++                               dbg_weights, DS4_N_EXPERT_USED, 0);
++
++            /* mid_all: per-expert post-clamp post-SwiGLU weighted intermediate. */
++            ds4_quantize_row_q8_K(x, dbg_xq, (int64_t)dbg_expert_in_dim);
++            matvec_iq2_xxs_experts_mid_prequant(dbg_mid_all, model,
++                                                layer->ffn_gate_exps,
++                                                layer->ffn_up_exps,
++                                                dbg_xq,
++                                                dbg_selected,
++                                                dbg_weights,
++                                                DS4_N_EXPERT_USED,
++                                                DS4_SWIGLU_CLAMP_EXP);
++            ds4_cpu_dump_stage("routed_expert_mid", il, t,
++                               dbg_mid_all,
++                               (uint64_t)DS4_N_EXPERT_USED * dbg_expert_out_dim, 0);
++
++            /* Final summed routed output (already in moe[t]). */
++            ds4_cpu_dump_stage("ffn_moe_out", il, t,
++                               moe + (uint64_t)t * DS4_N_EMBD,
++                               DS4_N_EMBD, 0);
++        }
++        free(dbg_xq);
++        free(dbg_mid_all);
++        free(dbg_probs);
++        free(dbg_logits);
++    }
++
+     t0 = profile ? now_sec() : 0.0;
+-    layer_shared_ffn_batch(shared, model, layer, norm, n_tok);
++    if (ds4_cpu_dump_stage_layer_active(il)) {
++        /* Inlined replica of layer_shared_ffn_batch so we can dump the gate /
++         * up / silu_mul intermediates.  Math identical to the helper. */
++        const uint64_t dbg_sh_hidden = layer->ffn_gate_shexp->dim[1];
++        float *dbg_sh_gate = xmalloc((size_t)n_tok * dbg_sh_hidden * sizeof(dbg_sh_gate[0]));
++        float *dbg_sh_up   = xmalloc((size_t)n_tok * dbg_sh_hidden * sizeof(dbg_sh_up[0]));
++        float *dbg_sh_mid  = xmalloc((size_t)n_tok * dbg_sh_hidden * sizeof(dbg_sh_mid[0]));
++        matmul_q8_0_pair_batch(dbg_sh_gate, dbg_sh_up, model,
++                               layer->ffn_gate_shexp,
++                               layer->ffn_up_shexp,
++                               norm,
++                               n_tok);
++        for (uint32_t t = 0; t < n_tok; t++) {
++            swiglu(dbg_sh_mid + (uint64_t)t * dbg_sh_hidden,
++                   dbg_sh_gate + (uint64_t)t * dbg_sh_hidden,
++                   dbg_sh_up + (uint64_t)t * dbg_sh_hidden,
++                   dbg_sh_hidden);
++            ds4_cpu_dump_stage("shared_gate", il, t,
++                               dbg_sh_gate + (uint64_t)t * dbg_sh_hidden,
++                               dbg_sh_hidden, 0);
++            ds4_cpu_dump_stage("shared_up", il, t,
++                               dbg_sh_up + (uint64_t)t * dbg_sh_hidden,
++                               dbg_sh_hidden, 0);
++            ds4_cpu_dump_stage("shared_silu_mul", il, t,
++                               dbg_sh_mid + (uint64_t)t * dbg_sh_hidden,
++                               dbg_sh_hidden, 0);
++        }
++        matmul_q8_0_batch(shared, model, layer->ffn_down_shexp, dbg_sh_mid, n_tok);
++        free(dbg_sh_mid);
++        free(dbg_sh_up);
++        free(dbg_sh_gate);
++    } else {
++        layer_shared_ffn_batch(shared, model, layer, norm, n_tok);
++    }
+     if (profile) t_shared = now_sec() - t0;
+ 
++    /* Stage dump: shared expert output (= shared_down) and combined ffn_out. */
++    if (ds4_cpu_dump_stage_layer_active(il)) {
++        for (uint32_t t = 0; t < n_tok; t++) {
++            ds4_cpu_dump_stage("ffn_shexp", il, t,
++                               shared + (uint64_t)t * DS4_N_EMBD,
++                               DS4_N_EMBD, 0);
++        }
++        /* ffn_out = moe + shared, matching the per-token sum hc_post_sum_batch
++         * does internally.  We materialize it in a small scratch for dumping. */
++        float *dbg_ffn_out = xmalloc((size_t)DS4_N_EMBD * sizeof(dbg_ffn_out[0]));
++        for (uint32_t t = 0; t < n_tok; t++) {
++            const float *m_t = moe + (uint64_t)t * DS4_N_EMBD;
++            const float *s_t = shared + (uint64_t)t * DS4_N_EMBD;
++            for (uint32_t i = 0; i < DS4_N_EMBD; i++) dbg_ffn_out[i] = m_t[i] + s_t[i];
++            ds4_cpu_dump_stage("ffn_out", il, t,
++                               dbg_ffn_out, DS4_N_EMBD, 0);
++        }
++        free(dbg_ffn_out);
++    }
++
+     t0 = profile ? now_sec() : 0.0;
+     hc_post_sum_batch(out_hc,
+                       moe,
+@@ -5790,6 +6073,16 @@ static void layer_ffn_shared_batch(
+                       n_hc);
+     if (profile) t_post = now_sec() - t0;
+ 
++    /* Stage dump: HC FFN expand output (next-layer input). */
++    if (ds4_cpu_dump_stage_layer_active(il)) {
++        const uint64_t hc_dim = (uint64_t)n_hc * DS4_N_EMBD;
++        for (uint32_t t = 0; t < n_tok; t++) {
++            ds4_cpu_dump_stage("hc_ffn_post", il, t,
++                               out_hc + (uint64_t)t * hc_dim,
++                               hc_dim, 0);
++        }
++    }
++
+     if (profile) {
+         fprintf(stderr,
+                 "ds4: prefill detail layer %u ffn hc_norm=%.3f routed=%.3f shared=%.3f post=%.3f total=%.3f\n",
+@@ -6919,6 +7212,24 @@ static void layer_attention_raw_swa_batch(
+                       n_tok);
+     if (profile) t_hc_norm = now_sec() - t0;
+ 
++    /* Stage dump: HC pre outputs and attn_norm. */
++    if (ds4_cpu_dump_stage_layer_active(il)) {
++        for (uint32_t t = 0; t < n_tok; t++) {
++            const uint32_t tk = pos0 + t;
++            ds4_cpu_dump_stage("hc_attn_pre_post_weights", il, tk,
++                               post + (uint64_t)t * n_hc, n_hc, 0);
++            ds4_cpu_dump_stage("hc_attn_pre_comb", il, tk,
++                               comb + (uint64_t)t * n_hc * n_hc,
++                               (uint64_t)n_hc * n_hc, 0);
++            ds4_cpu_dump_stage("hc_attn_pre", il, tk,
++                               attn_cur + (uint64_t)t * DS4_N_EMBD,
++                               DS4_N_EMBD, 0);
++            ds4_cpu_dump_stage("attn_norm", il, tk,
++                               attn_norm + (uint64_t)t * DS4_N_EMBD,
++                               DS4_N_EMBD, 0);
++        }
++    }
++
+     t0 = profile ? now_sec() : 0.0;
+     matmul_q8_0_batch(qr, model, layer->attn_q_a, attn_norm, n_tok);
+     for (uint32_t t = 0; t < n_tok; t++) {
+@@ -6928,17 +7239,49 @@ static void layer_attention_raw_swa_batch(
+                         1024,
+                         DS4_RMS_EPS);
+     }
++    /* Stage dump: q_lora (after attn_q_a) and q_lora_norm (after RMSNorm). */
++    if (ds4_cpu_dump_stage_layer_active(il)) {
++        for (uint32_t t = 0; t < n_tok; t++) {
++            const uint32_t tk = pos0 + t;
++            ds4_cpu_dump_stage("q_lora", il, tk,
++                               qr + (uint64_t)t * 1024, 1024, 0);
++            ds4_cpu_dump_stage("q_lora_norm", il, tk,
++                               qr_norm + (uint64_t)t * 1024, 1024, 0);
++        }
++    }
+     matmul_q8_0_batch(q, model, layer->attn_q_b, qr_norm, n_tok);
++    /* Stage dump: Qraw (after attn_q_b, before per-head RMSNorm). */
++    if (ds4_cpu_dump_stage_layer_active(il)) {
++        for (uint32_t t = 0; t < n_tok; t++) {
++            ds4_cpu_dump_stage("Qraw", il, pos0 + t,
++                               q + (uint64_t)t * q_dim, q_dim, 0);
++        }
++    }
+     for (uint32_t t = 0; t < n_tok; t++) {
+         head_rms_norm_inplace(q + (uint64_t)t * q_dim,
+                               DS4_N_HEAD,
+                               DS4_N_HEAD_DIM,
+                               DS4_RMS_EPS);
+     }
++    /* Stage dump: Qnorm (after per-head RMSNorm, before tail RoPE). */
++    if (ds4_cpu_dump_stage_layer_active(il)) {
++        for (uint32_t t = 0; t < n_tok; t++) {
++            ds4_cpu_dump_stage("Qnorm", il, pos0 + t,
++                               q + (uint64_t)t * q_dim, q_dim, 0);
++        }
++    }
+     if (profile) t_q = now_sec() - t0;
+ 
+     t0 = profile ? now_sec() : 0.0;
+     matmul_q8_0_batch(kv_raw, model, layer->attn_kv, attn_norm, n_tok);
++    /* Stage dump: KVraw (after attn_kv matmul, before RMSNorm). */
++    if (ds4_cpu_dump_stage_layer_active(il)) {
++        for (uint32_t t = 0; t < n_tok; t++) {
++            ds4_cpu_dump_stage("KVraw", il, pos0 + t,
++                               kv_raw + (uint64_t)t * DS4_N_HEAD_DIM,
++                               DS4_N_HEAD_DIM, 0);
++        }
++    }
+     for (uint32_t t = 0; t < n_tok; t++) {
+         rms_norm_weight(kv + (uint64_t)t * DS4_N_HEAD_DIM,
+                         kv_raw + (uint64_t)t * DS4_N_HEAD_DIM,
+@@ -6946,6 +7289,14 @@ static void layer_attention_raw_swa_batch(
+                         DS4_N_HEAD_DIM,
+                         DS4_RMS_EPS);
+     }
++    /* Stage dump: KVnorm (after kv RMSNorm, before tail RoPE). */
++    if (ds4_cpu_dump_stage_layer_active(il)) {
++        for (uint32_t t = 0; t < n_tok; t++) {
++            ds4_cpu_dump_stage("KVnorm", il, pos0 + t,
++                               kv + (uint64_t)t * DS4_N_HEAD_DIM,
++                               DS4_N_HEAD_DIM, 0);
++        }
++    }
+     if (profile) t_kv = now_sec() - t0;
+ 
+     t0 = profile ? now_sec() : 0.0;
+@@ -7007,6 +7358,16 @@ static void layer_attention_raw_swa_batch(
+                                       false,
+                                       n_tok);
+         if (profile) t_tl_rope_cache += now_sec() - tx;
++        /* Stage dump: Qcur and KVrope when batch RoPE applied. */
++        if (ds4_cpu_dump_stage_layer_active(il)) {
++            for (uint32_t t = 0; t < n_tok; t++) {
++                ds4_cpu_dump_stage("Qcur", il, pos0 + t,
++                                   q + (uint64_t)t * q_dim, q_dim, 0);
++                ds4_cpu_dump_stage("KVrope", il, pos0 + t,
++                                   kv + (uint64_t)t * DS4_N_HEAD_DIM,
++                                   DS4_N_HEAD_DIM, 0);
++            }
++        }
+     }
+ 
+     for (uint32_t t = 0; t < n_tok; t++) {
+@@ -7019,8 +7380,13 @@ static void layer_attention_raw_swa_batch(
+         if (!batch_prefix_rope) {
+             rope_tail_layer_inplace(q_t, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
+             rope_tail_layer_inplace(kv_t, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
++            /* Stage dump: Qcur (after tail RoPE) and KVrope (after tail RoPE). */
++            ds4_cpu_dump_stage("Qcur", il, pos, q_t, q_dim, 0);
++            ds4_cpu_dump_stage("KVrope", il, pos, kv_t, DS4_N_HEAD_DIM, 0);
+         }
+         dsv4_fp8_kv_quantize_row_inplace_cpu(kv_t, DS4_N_HEAD_DIM, DS4_N_ROT);
++        /* Stage dump: KVcur (after fp8 round-trip). */
++        ds4_cpu_dump_stage("KVcur", il, pos, kv_t, DS4_N_HEAD_DIM, 0);
+ 
+         kv_cache_push_raw(cache, kv_t);
+         if (profile) t_tl_rope_cache += now_sec() - tx;
+@@ -7044,6 +7410,24 @@ static void layer_attention_raw_swa_batch(
+                 kv_cache_push_comp(cache->attn_comp_kv, &cache->n_comp, cache->comp_cap, DS4_N_HEAD_DIM, comp);
+             }
+ 
++            /* Stage dump (M1.5): attention compressor state and emitted row.
++             * State buffers persist across tokens; we dump the post-update
++             * snapshot.  KVcompress only emits on `have_comp` (ratio-4 layer
++             * emits every 4 tokens, ratio-128 every 128). */
++            if (ds4_cpu_dump_stage_layer_active(il)) {
++                const uint32_t coff = ratio == 4 ? 2u : 1u;
++                const uint64_t state_n = (uint64_t)coff * DS4_N_HEAD_DIM
++                                       * (uint64_t)coff * ratio;
++                ds4_cpu_dump_stage("compressor_state_kv", il, pos,
++                                   cache->attn_state_kv, state_n, 0);
++                ds4_cpu_dump_stage("compressor_state_score", il, pos,
++                                   cache->attn_state_score, state_n, 0);
++                if (have_comp) {
++                    ds4_cpu_dump_stage("KVcompress", il, pos,
++                                       comp, DS4_N_HEAD_DIM, 0);
++                }
++            }
++
+             if (ratio == 4) {
+                 float *index_comp = index_comp_scratch;
+                 const bool have_index_comp = compressor_decode_one(index_comp, model,
+@@ -7063,6 +7447,21 @@ static void layer_attention_raw_swa_batch(
+                 }
+                 if (profile) t_tl_compress += now_sec() - tx;
+ 
++                /* Stage dump (M1.5): indexer compressor state + emitted row. */
++                if (ds4_cpu_dump_stage_layer_active(il)) {
++                    const uint32_t coff = 2u; /* ratio == 4 here */
++                    const uint64_t istate_n = (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM
++                                            * (uint64_t)coff * ratio;
++                    ds4_cpu_dump_stage("indexer_state_kv", il, pos,
++                                       cache->index_state_kv, istate_n, 0);
++                    ds4_cpu_dump_stage("indexer_state_score", il, pos,
++                                       cache->index_state_score, istate_n, 0);
++                    if (have_index_comp) {
++                        ds4_cpu_dump_stage("indexer_KVcompress", il, pos,
++                                           index_comp, DS4_N_INDEXER_HEAD_DIM, 0);
++                    }
++                }
++
+                 tx = profile ? now_sec() : 0.0;
+                 comp_allowed = indexer_allowed_decode_one(model, layer,
+                                                           attn_norm + (uint64_t)t * DS4_N_EMBD,
+@@ -7071,6 +7470,25 @@ static void layer_attention_raw_swa_batch(
+                                                           cache->n_index_comp,
+                                                           il, pos);
+                 if (profile) t_tl_indexer += now_sec() - tx;
++
++                /* Stage dump (M1.5): indexer top-k allowed mask.  When
++                 * cache->n_index_comp == 0 (early prefill tokens), the
++                 * function returns NULL and we skip the dump.  When
++                 * n_index_comp <= N_INDEXER_TOP_K (short prompt case), all
++                 * compressed rows are allowed and the mask is all-true.  Long
++                 * prompts will exercise the actual top-k scoring path. */
++                if (ds4_cpu_dump_stage_layer_active(il) &&
++                    comp_allowed && cache->n_index_comp > 0) {
++                    /* Convert bool[] to int32[] for stable on-disk layout. */
++                    int32_t *dbg_allowed = xmalloc((size_t)cache->n_index_comp
++                                                  * sizeof(dbg_allowed[0]));
++                    for (uint32_t c = 0; c < cache->n_index_comp; c++) {
++                        dbg_allowed[c] = comp_allowed[c] ? 1 : 0;
++                    }
++                    ds4_cpu_dump_stage("indexer_allowed", il, pos,
++                                       dbg_allowed, cache->n_index_comp, 2);
++                    free(dbg_allowed);
++                }
+             } else {
+                 if (profile) t_tl_compress += now_sec() - tx;
+             }
+@@ -7104,6 +7522,10 @@ static void layer_attention_raw_swa_batch(
+         }
+ 
+         if (!prefix_batch_attn) {
++            /* Stage dump: kqv_out (heads after attention, before inverse RoPE). */
++            ds4_cpu_dump_stage("kqv_out", il, pos,
++                               heads + (uint64_t)t * q_dim, q_dim, 0);
++
+             tx = profile ? now_sec() : 0.0;
+             rope_tail_layer_inplace(heads + (uint64_t)t * q_dim,
+                                     DS4_N_HEAD,
+@@ -7113,6 +7535,10 @@ static void layer_attention_raw_swa_batch(
+                                     il,
+                                     true);
+             if (profile) t_tl_inv_rope += now_sec() - tx;
++
++            /* Stage dump: kqv_back (heads after inverse RoPE). */
++            ds4_cpu_dump_stage("kqv_back", il, pos,
++                               heads + (uint64_t)t * q_dim, q_dim, 0);
+         }
+ 
+         free(comp_allowed);
+@@ -7135,6 +7561,13 @@ static void layer_attention_raw_swa_batch(
+                                      n_tok,
+                                      cache->cap_raw);
+         if (profile) t_tl_attn_rows += now_sec() - tx;
++        /* Stage dump: kqv_out for the prefix-batch path (before inverse RoPE). */
++        if (ds4_cpu_dump_stage_layer_active(il)) {
++            for (uint32_t t = 0; t < n_tok; t++) {
++                ds4_cpu_dump_stage("kqv_out", il, pos0 + t,
++                                   heads + (uint64_t)t * q_dim, q_dim, 0);
++            }
++        }
+         tx = profile ? now_sec() : 0.0;
+         if (batch_prefix_rope) {
+             rope_tail_layer_batch_inplace(heads,
+@@ -7158,11 +7591,46 @@ static void layer_attention_raw_swa_batch(
+             }
+         }
+         if (profile) t_tl_inv_rope += now_sec() - tx;
++        /* Stage dump: kqv_back for the prefix-batch path (after inverse RoPE). */
++        if (ds4_cpu_dump_stage_layer_active(il)) {
++            for (uint32_t t = 0; t < n_tok; t++) {
++                ds4_cpu_dump_stage("kqv_back", il, pos0 + t,
++                                   heads + (uint64_t)t * q_dim, q_dim, 0);
++            }
++        }
+     }
+     if (profile) t_token_loop = now_sec() - t0;
+ 
+     t0 = profile ? now_sec() : 0.0;
+-    layer_grouped_out_batch(attn_out, model, layer, heads, n_tok);
++    if (ds4_cpu_dump_stage_layer_active(il)) {
++        /* Inlined replica of layer_grouped_out_batch so we can dump attn_low. */
++        const uint32_t dbg_n_groups = 8;
++        const uint32_t dbg_group_heads = DS4_N_HEAD / dbg_n_groups;
++        const uint32_t dbg_group_dim = DS4_N_HEAD_DIM * dbg_group_heads;
++        const uint32_t dbg_rank = 1024;
++        float *dbg_low = xcalloc((size_t)n_tok * dbg_n_groups * dbg_rank,
++                                 sizeof(dbg_low[0]));
++        matmul_q8_0_grouped_batch(dbg_low, model, layer->attn_output_a, heads,
++                                  n_tok, dbg_n_groups, dbg_group_dim, dbg_rank);
++        for (uint32_t t = 0; t < n_tok; t++) {
++            ds4_cpu_dump_stage("attn_low", il, pos0 + t,
++                               dbg_low + (uint64_t)t * dbg_n_groups * dbg_rank,
++                               (uint64_t)dbg_n_groups * dbg_rank, 0);
++        }
++        matmul_q8_0_batch(attn_out, model, layer->attn_output_b, dbg_low, n_tok);
++        free(dbg_low);
++    } else {
++        layer_grouped_out_batch(attn_out, model, layer, heads, n_tok);
++    }
++
++    /* Stage dump: attn_out (after grouped LoRA output projection). */
++    if (ds4_cpu_dump_stage_layer_active(il)) {
++        for (uint32_t t = 0; t < n_tok; t++) {
++            ds4_cpu_dump_stage("attn_out", il, pos0 + t,
++                               attn_out + (uint64_t)t * DS4_N_EMBD,
++                               DS4_N_EMBD, 0);
++        }
++    }
+ 
+     hc_post_batch(after_attn_hc,
+                   attn_out,
+@@ -7427,6 +7895,16 @@ static void forward_token_raw_swa_cpu(
+ }
+ #endif
+ 
++/* Forward decl: output_hc_head_one is defined alongside output_logits_one
++ * later in the file; the dump branch in prefill_layer_major_cpu calls it
++ * inline so the four output-head stage tensors can be emitted between
++ * sub-steps without changing output_logits_one's call sites. */
++static void output_hc_head_one(
++        float             * out,
++        const ds4_model   * model,
++        const ds4_weights * weights,
++        const float       * inp_hc);
++
+ /* CPU prefill in layer-major order.  All prompt tokens pass through layer 0,
+  * then layer 1, etc., which exposes batch matmul opportunities. */
+ static void prefill_layer_major_cpu(
+@@ -7435,6 +7913,7 @@ static void prefill_layer_major_cpu(
+         const ds4_weights * weights,
+         ds4_kv_cache      * cache,
+         const token_vec   * prompt) {
++    ds4_cpu_dump_stage_init();
+     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+     const uint64_t n_tok = (uint64_t)prompt->len;
+     float *cur = xmalloc((size_t)n_tok * hc_dim * sizeof(cur[0]));
+@@ -7560,7 +8039,51 @@ static void prefill_layer_major_cpu(
+     kv_cache_finish_prefill_states(cache, (uint32_t)n_tok);
+ 
+     if (logits) {
+-        output_logits_one(logits, model, weights, cur + (n_tok - 1) * hc_dim);
++        if (ds4_cpu_dump_stages_dir) {
++            /* Inlined replica of output_logits_one (ds4.c:8127) so we can
++             * dump the four output-head stage tensors.  Math identical:
++             *   1) output_hc_head_pre  = residual_hc input to HC collapse
++             *      (= cur + last-token offset, [N_HC, N_EMBD]).
++             *   2) output_hc_head_post = output_hc_head_one (rms_norm_no_weight
++             *      + matvec_f16(output_hc_fn) + sigmoid+eps + hc_weighted_sum,
++             *      ds4.c:8099).
++             *   3) output_norm_out     = rms_norm_weight(output_norm).
++             *   4) output_logits       = matvec_q8_0(output) — final fp32
++             *      [N_VOCAB] logits.
++             * The unfiltered dump helper bypasses DS4_CPU_DUMP_STAGES_LAYERS
++             * (output head is not per-layer), and we tag with il = N_LAYER
++             * (= 43) so the on-disk filenames are unambiguous and follow the
++             * existing il<LL>_tok<TT>_<tag>.bin convention.  token_idx is
++             * the last prompt token (n_tok-1), which matches what the
++             * argmax sampler consumes from the prefill `logits` buffer. */
++            const uint32_t out_il = (uint32_t)DS4_N_LAYER;
++            const uint32_t out_tok = (uint32_t)(n_tok - 1);
++            const float *inp_hc = cur + (n_tok - 1) * hc_dim;
++
++            ds4_cpu_dump_stage_unfiltered("output_hc_head_pre", out_il, out_tok,
++                                          inp_hc, hc_dim, 0);
++
++            float *embd = xmalloc((size_t)DS4_N_EMBD * sizeof(embd[0]));
++            float *norm = xmalloc((size_t)DS4_N_EMBD * sizeof(norm[0]));
++
++            output_hc_head_one(embd, model, weights, inp_hc);
++            ds4_cpu_dump_stage_unfiltered("output_hc_head_post", out_il, out_tok,
++                                          embd, DS4_N_EMBD, 0);
++
++            rms_norm_weight(norm, embd, tensor_data(model, weights->output_norm),
++                            DS4_N_EMBD, DS4_RMS_EPS);
++            ds4_cpu_dump_stage_unfiltered("output_norm_out", out_il, out_tok,
++                                          norm, DS4_N_EMBD, 0);
++
++            matvec_q8_0(logits, model, weights->output, norm);
++            ds4_cpu_dump_stage_unfiltered("output_logits", out_il, out_tok,
++                                          logits, DS4_N_VOCAB, 0);
++
++            free(norm);
++            free(embd);
++        } else {
++            output_logits_one(logits, model, weights, cur + (n_tok - 1) * hc_dim);
++        }
+     }
+ 
+     if (decode_scratch_ready) cpu_decode_scratch_free(&decode_scratch);
